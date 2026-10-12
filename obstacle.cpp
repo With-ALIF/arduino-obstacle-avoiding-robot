@@ -1,290 +1,248 @@
 #include <Arduino.h>
-#include <Wire.h>
-#include <LiquidCrystal_PCF8574.h>
-#include <ESP32Servo.h>
+#include <Servo.h>
 
-constexpr uint8_t PIN_MOTOR_ENA = 14;
-constexpr uint8_t PIN_MOTOR_IN1 = 27;
-constexpr uint8_t PIN_MOTOR_IN2 = 26;
-constexpr uint8_t PIN_MOTOR_IN3 = 25;
-constexpr uint8_t PIN_MOTOR_IN4 = 33;
-constexpr uint8_t PIN_MOTOR_ENB = 32;
+// ===== L298N MOTOR PINS =====
+const byte ENA = 3;   // Left motor PWM
+const byte IN1 = 7;
+const byte IN2 = 6;
 
-constexpr uint8_t PIN_US_TRIG   = 5;
-constexpr uint8_t PIN_US_ECHO   = 18;
+const byte ENB = 11;  // Right motor PWM
+const byte IN3 = 5;
+const byte IN4 = 4;
 
-constexpr uint8_t PIN_IR_HOLE   = 34;
-constexpr uint8_t HOLE_STATE    = HIGH;
+// ===== HC-SR04 =====
+const byte TRIG_PIN = 9;
+const byte ECHO_PIN = 8;
 
-constexpr uint8_t PIN_SERVO     = 19;
+// ===== SERVO =====
+const byte SERVO_PIN = 10;
 
-constexpr uint8_t PIN_I2C_SDA   = 21;
-constexpr uint8_t PIN_I2C_SCL   = 22;
-constexpr uint8_t LCD_I2C_ADDR  = 0x27;
+// ===== SPEED SETTINGS =====
+const byte NORMAL_SPEED = 130; // 0-255
+const byte TURN_SPEED = 230;   // 0-255
+const byte UTURN_SPEED = 230;
 
-constexpr float   OBSTACLE_THRESHOLD_CM = 25.0f;
-constexpr uint8_t DEFAULT_SPEED         = 180;
-constexpr uint8_t TURN_SPEED            = 200;
+// ===== OBSTACLE SETTINGS =====
+const float OBSTACLE_LIMIT = 30.0;
+const float EQUAL_LIMIT = 5.0;
 
-constexpr int SERVO_LEFT_ANGLE   = 150;
-constexpr int SERVO_CENTER_ANGLE = 90;
-constexpr int SERVO_RIGHT_ANGLE  = 30;
+const byte SERVO_CENTER = 90;
+const byte SERVO_LEFT = 150;
+const byte SERVO_RIGHT = 30;
 
-constexpr uint32_t LCD_UPDATE_INTERVAL_MS = 250;
-constexpr uint32_t PULSE_TIMEOUT_US       = 25000;
+// Tune these for your floor and wheels
+const unsigned int TURN_90_TIME = 400;
+const unsigned int TURN_180_TIME = 800;
 
-LiquidCrystal_PCF8574 lcd(LCD_I2C_ADDR);
-Servo              panServo;
+Servo scanner;
 
-uint32_t lastLcdUpdateMs = 0;
+float leftDistance = -1;
+float rightDistance = -1;
 
-void stopMotor();
-void moveForward(uint8_t speed = DEFAULT_SPEED);
-void moveBackward(uint8_t speed = DEFAULT_SPEED);
-void turnLeft(uint8_t speed = TURN_SPEED);
-void turnRight(uint8_t speed = TURN_SPEED);
+// Function declarations
+void stopCar();
+void forward();
+void turnLeft();
+void turnRight();
+void turnAround();
+float getDistance();
+void scanSides();
 
-float readUltrasonic();
-bool readHoleSensor();
-int scanDirection();
-void updateLCD(const char* line1Msg, const char* line2Msg);
-
+// ===== SETUP =====
 void setup() {
-  Serial.begin(115200);
-  while (!Serial && millis() < 2000) {}
-  Serial.println(F("\n=========================================="));
-  Serial.println(F(" ESP32 Robot OS Initializing... "));
-  Serial.println(F("=========================================="));
+  Serial.begin(9600);
 
-  Wire.begin(PIN_I2C_SDA, PIN_I2C_SCL);
+  pinMode(ENA, OUTPUT);
+  pinMode(ENB, OUTPUT);
 
-  lcd.begin(16, 2);
-  lcd.setBacklight(255);
-  lcd.clear();
-  updateLCD("ESP32 Robot OS", "Initializing...");
+  pinMode(IN1, OUTPUT);
+  pinMode(IN2, OUTPUT);
+  pinMode(IN3, OUTPUT);
+  pinMode(IN4, OUTPUT);
 
-  pinMode(PIN_MOTOR_ENA, OUTPUT);
-  pinMode(PIN_MOTOR_IN1, OUTPUT);
-  pinMode(PIN_MOTOR_IN2, OUTPUT);
-  pinMode(PIN_MOTOR_IN3, OUTPUT);
-  pinMode(PIN_MOTOR_IN4, OUTPUT);
-  pinMode(PIN_MOTOR_ENB, OUTPUT);
-  stopMotor();
+  pinMode(TRIG_PIN, OUTPUT);
+  pinMode(ECHO_PIN, INPUT);
 
-  pinMode(PIN_US_TRIG, OUTPUT);
-  pinMode(PIN_US_ECHO, INPUT);
-  digitalWrite(PIN_US_TRIG, LOW);
+  digitalWrite(TRIG_PIN, LOW);
 
-  pinMode(PIN_IR_HOLE, INPUT);
-  Serial.println(F("[INIT] TCRT5000L IR Hole Sensor Initialized on GPIO 34."));
+  scanner.attach(SERVO_PIN);
+  scanner.write(SERVO_CENTER);
 
-  panServo.setPeriodHertz(50);
-  panServo.attach(PIN_SERVO, 500, 2400);
-  panServo.write(SERVO_CENTER_ANGLE);
+  stopCar();
 
-  delay(1500);
-
-  updateLCD("System Ready!", "Starting Robot");
-  Serial.println(F("[INIT] Initialization Complete. Starting main loop."));
-  delay(1000);
+  Serial.println("PWM Obstacle Avoiding Car Ready");
 }
 
+// ===== MAIN LOOP =====
 void loop() {
-  float obstacleDist  = readUltrasonic();
-  bool holeDetected   = readHoleSensor();
+  scanner.write(SERVO_CENTER);
 
-  Serial.print(F("Obstacle Dist: "));
-  if (obstacleDist < 0) {
-    Serial.print(F("ERROR/TIMEOUT"));
-  } else {
-    Serial.print(obstacleDist, 1);
-    Serial.print(F(" cm"));
-  }
+  float frontDistance = getDistance();
 
-  Serial.print(F(" | TCRT5000L Hole IR: "));
-  Serial.println(holeDetected ? F("HOLE DETECTED!") : F("CLEAR (Ground OK)"));
-
-  if (holeDetected) {
-    Serial.println(F("[SAFETY] HOLE DETECTED by TCRT5000L IR! Executing E-Stop & Backup."));
-    
-    stopMotor();
-
-    updateLCD("Hole Detected!", "Backing...");
-
-    delay(400);
-
-    moveBackward(DEFAULT_SPEED);
-    delay(800);
-
-    stopMotor();
-    delay(200);
-
-    turnRight(TURN_SPEED);
-    delay(600);
-
-    stopMotor();
-    delay(300);
+  Serial.print("Front: ");
+  if (frontDistance < 0) {
+    Serial.println("INVALID");
+    stopCar();
+    delay(50);
     return;
   }
 
-  if (obstacleDist > 0.0f && obstacleDist < OBSTACLE_THRESHOLD_CM) {
-    Serial.printf("[AVOIDANCE] Obstacle detected at %.1f cm! Stopping & scanning...\n", obstacleDist);
-    
-    stopMotor();
+  Serial.print(frontDistance);
+  Serial.println(" cm");
 
-    char obsLine1[17];
-    snprintf(obsLine1, sizeof(obsLine1), "Obstacle %.0fcm", obstacleDist);
+  if (frontDistance <= OBSTACLE_LIMIT) {
+    // Stop before scanning
+    stopCar();
+    delay(150);
 
-    updateLCD(obsLine1, "Scanning...");
+    scanSides();
 
-    int bestDirection = scanDirection();
+    Serial.print("Left: ");
+    Serial.print(leftDistance);
+    Serial.print(" cm | Right: ");
+    Serial.print(rightDistance);
+    Serial.println(" cm");
 
-    if (bestDirection > 0) {
-      Serial.println(F("[ACTION] Free path on LEFT. Turning left."));
-      updateLCD(obsLine1, "Turning Left");
-      turnLeft(TURN_SPEED);
-      delay(500);
-    } else if (bestDirection < 0) {
-      Serial.println(F("[ACTION] Free path on RIGHT. Turning right."));
-      updateLCD(obsLine1, "Turning Right");
-      turnRight(TURN_SPEED);
-      delay(500);
-    } else {
-      Serial.println(F("[ACTION] Dead end! Backing up and turning."));
-      updateLCD(obsLine1, "Dead End!");
-      moveBackward(DEFAULT_SPEED);
-      delay(700);
-      turnRight(TURN_SPEED);
-      delay(700);
+    // Never choose a direction using invalid readings
+    if (leftDistance < 0 || rightDistance < 0) {
+      stopCar();
+      delay(100);
+      return;
     }
 
-    stopMotor();
-    delay(200);
-    return;
+    if (abs(leftDistance - rightDistance) <= EQUAL_LIMIT) {
+      turnAround();
+    }
+    else if (leftDistance > rightDistance) {
+      turnLeft();
+    }
+    else {
+      turnRight();
+    }
+
+    stopCar();
+    scanner.write(SERVO_CENTER);
+    delay(150);
+  }
+  else {
+    forward();
   }
 
-  moveForward(DEFAULT_SPEED);
-
-  if (millis() - lastLcdUpdateMs >= LCD_UPDATE_INTERVAL_MS) {
-    lastLcdUpdateMs = millis();
-    updateLCD("System Normal", "Moving Forward");
-  }
-
-  delay(50);
+  delay(20);
 }
 
-
-void stopMotor() {
-  digitalWrite(PIN_MOTOR_IN1, LOW);
-  digitalWrite(PIN_MOTOR_IN2, LOW);
-  digitalWrite(PIN_MOTOR_IN3, LOW);
-  digitalWrite(PIN_MOTOR_IN4, LOW);
-  analogWrite(PIN_MOTOR_ENA, 0);
-  analogWrite(PIN_MOTOR_ENB, 0);
-}
-
-void moveForward(uint8_t speed) {
-  digitalWrite(PIN_MOTOR_IN1, HIGH);
-  digitalWrite(PIN_MOTOR_IN2, LOW);
-  digitalWrite(PIN_MOTOR_IN3, HIGH);
-  digitalWrite(PIN_MOTOR_IN4, LOW);
-  analogWrite(PIN_MOTOR_ENA, speed);
-  analogWrite(PIN_MOTOR_ENB, speed);
-}
-
-void moveBackward(uint8_t speed) {
-  digitalWrite(PIN_MOTOR_IN1, LOW);
-  digitalWrite(PIN_MOTOR_IN2, HIGH);
-  digitalWrite(PIN_MOTOR_IN3, LOW);
-  digitalWrite(PIN_MOTOR_IN4, HIGH);
-  analogWrite(PIN_MOTOR_ENA, speed);
-  analogWrite(PIN_MOTOR_ENB, speed);
-}
-
-void turnLeft(uint8_t speed) {
-  digitalWrite(PIN_MOTOR_IN1, LOW);
-  digitalWrite(PIN_MOTOR_IN2, HIGH);
-  digitalWrite(PIN_MOTOR_IN3, HIGH);
-  digitalWrite(PIN_MOTOR_IN4, LOW);
-  analogWrite(PIN_MOTOR_ENA, speed);
-  analogWrite(PIN_MOTOR_ENB, speed);
-}
-
-void turnRight(uint8_t speed) {
-  digitalWrite(PIN_MOTOR_IN1, HIGH);
-  digitalWrite(PIN_MOTOR_IN2, LOW);
-  digitalWrite(PIN_MOTOR_IN3, LOW);
-  digitalWrite(PIN_MOTOR_IN4, HIGH);
-  analogWrite(PIN_MOTOR_ENA, speed);
-  analogWrite(PIN_MOTOR_ENB, speed);
-}
-
-
-float readUltrasonic() {
-  digitalWrite(PIN_US_TRIG, LOW);
+// ===== ULTRASONIC DISTANCE =====
+float getDistance() {
+  digitalWrite(TRIG_PIN, LOW);
   delayMicroseconds(2);
 
-  digitalWrite(PIN_US_TRIG, HIGH);
+  digitalWrite(TRIG_PIN, HIGH);
   delayMicroseconds(10);
-  digitalWrite(PIN_US_TRIG, LOW);
+  digitalWrite(TRIG_PIN, LOW);
 
-  unsigned long duration = pulseIn(PIN_US_ECHO, HIGH, PULSE_TIMEOUT_US);
+  unsigned long duration = pulseIn(ECHO_PIN, HIGH, 12000UL);
 
   if (duration == 0) {
-    return -1.0f;
-  }
-
-  float distanceCm = (duration * 0.0343f) / 2.0f;
-
-  if (distanceCm < 2.0f || distanceCm > 400.0f) {
-    return -1.0f;
-  }
-
-  return distanceCm;
-}
-
-bool readHoleSensor() {
-  int sensorVal = digitalWrite ? digitalRead(PIN_IR_HOLE) : LOW;
-  return (sensorVal == HOLE_STATE);
-}
-
-int scanDirection() {
-  panServo.write(SERVO_LEFT_ANGLE);
-  delay(400);
-  float leftDistance = readUltrasonic();
-  Serial.print(F("[SCAN] Left Distance: "));
-  Serial.println(leftDistance);
-
-  panServo.write(SERVO_RIGHT_ANGLE);
-  delay(400);
-  float rightDistance = readUltrasonic();
-  Serial.print(F("[SCAN] Right Distance: "));
-  Serial.println(rightDistance);
-
-  panServo.write(SERVO_CENTER_ANGLE);
-  delay(300);
-
-  if (leftDistance > OBSTACLE_THRESHOLD_CM && leftDistance >= rightDistance) {
-    return 1;
-  } else if (rightDistance > OBSTACLE_THRESHOLD_CM && rightDistance > leftDistance) {
     return -1;
   }
 
-  return 0;
-}
+  float cm = duration * 0.0343 / 2.0;
 
-
-void updateLCD(const char* line1Msg, const char* line2Msg) {
-  lcd.setCursor(0, 0);
-  lcd.print(line1Msg);
-  for (int i = strlen(line1Msg); i < 16; i++) {
-    lcd.print(F(" "));
+  if (cm < 2.0 || cm > 200.0) {
+    return -1;
   }
 
-  lcd.setCursor(0, 1);
-  lcd.print(line2Msg);
-  for (int i = strlen(line2Msg); i < 16; i++) {
-    lcd.print(F(" "));
-  }
+  return cm;
 }
 
+// ===== SCAN SIDES =====
+void scanSides() {
+  scanner.write(SERVO_LEFT);
+  delay(350);
+  leftDistance = getDistance();
+
+  scanner.write(SERVO_RIGHT);
+  delay(450);
+  rightDistance = getDistance();
+
+  scanner.write(SERVO_CENTER);
+  delay(250);
+}
+
+// ===== FORWARD: LOW SPEED =====
+void forward() {
+  // Left motor forward
+  digitalWrite(IN1, HIGH);
+  digitalWrite(IN2, LOW);
+
+  // Right motor forward
+  digitalWrite(IN3, HIGH);
+  digitalWrite(IN4, LOW);
+
+  analogWrite(ENA, NORMAL_SPEED);
+  analogWrite(ENB, NORMAL_SPEED);
+}
+
+// ===== STOP =====
+void stopCar() {
+  analogWrite(ENA, 0);
+  analogWrite(ENB, 0);
+
+  digitalWrite(IN1, LOW);
+  digitalWrite(IN2, LOW);
+  digitalWrite(IN3, LOW);
+  digitalWrite(IN4, LOW);
+}
+
+// ===== LEFT TURN: HIGH SPEED =====
+void turnLeft() {
+  // Left motor backward
+  digitalWrite(IN1, LOW);
+  digitalWrite(IN2, HIGH);
+
+  // Right motor forward
+  digitalWrite(IN3, HIGH);
+  digitalWrite(IN4, LOW);
+
+  analogWrite(ENA, TURN_SPEED);
+  analogWrite(ENB, TURN_SPEED);
+
+  delay(TURN_90_TIME);
+  stopCar();
+  delay(150);
+}
+
+// ===== RIGHT TURN: HIGH SPEED =====
+void turnRight() {
+  // Left motor forward
+  digitalWrite(IN1, HIGH);
+  digitalWrite(IN2, LOW);
+
+  // Right motor backward
+  digitalWrite(IN3, LOW);
+  digitalWrite(IN4, HIGH);
+
+  analogWrite(ENA, TURN_SPEED);
+  analogWrite(ENB, TURN_SPEED);
+
+  delay(TURN_90_TIME);
+  stopCar();
+  delay(150);
+}
+
+// ===== 180-DEGREE TURN =====
+void turnAround() {
+  // Pivot in place
+  digitalWrite(IN1, HIGH);
+  digitalWrite(IN2, LOW);
+
+  digitalWrite(IN3, LOW);
+  digitalWrite(IN4, HIGH);
+
+  analogWrite(ENA, UTURN_SPEED);
+  analogWrite(ENB, UTURN_SPEED);
+
+  delay(TURN_180_TIME);
+  stopCar();
+  delay(250);
+}
